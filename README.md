@@ -6,6 +6,9 @@ Gemini Enterprise app as a data store, and wired for end-user credential
 propagation — including an OAuth 2.1 proxy for MCP servers that have no static
 client ID and secret.
 
+Licensed under [Apache 2.0](LICENSE). Not an official Google product — see
+[Disclaimer](#disclaimer).
+
 ```
 prompt + docs
      │
@@ -717,3 +720,27 @@ reach, but no real user has driven them in production. Expect to be the first.
   services share a Firestore database, and a provisioning run writes a proxy
   client that the other service reads; that handoff has tests but no live
   consent flow behind it.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) for the full text.
+
+## Disclaimer
+
+**This is not an officially supported Google product.** It is an independent
+project, not affiliated with, endorsed by, or supported by Google. "Gemini
+Enterprise", "Agent Registry", "Discovery Engine", "Cloud Run" and "Vertex AI"
+are Google products referred to here descriptively.
+
+It calls Google Cloud APIs on your behalf, and your use of those APIs remains
+governed by your own agreement with Google. Several of the surfaces it depends
+on are **v1alpha** and carry no compatibility guarantee: they can change
+behaviour or disappear without notice, which is why the drift detection
+described above exists.
+
+The software is provided on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS
+OF ANY KIND, as set out in the License. It provisions real infrastructure —
+Cloud Run services, service accounts, IAM bindings, secrets and Discovery
+Engine resources — in a project you nominate, and it can incur cost. You are
+responsible for what it creates. Read [Security posture](#security-posture-read-before-deploying)
+and [Limitations](#limitations) before pointing it at anything you care about.

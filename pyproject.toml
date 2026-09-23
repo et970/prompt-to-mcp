@@ -3,6 +3,8 @@ name = "prompt-to-mcp"
 version = "1.0.2"
 description = "Turn a prompt + API docs into a deployed, registered, Gemini-Enterprise-connected MCP server."
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
@@ -23,7 +25,8 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["setuptools>=75"]
+# 77 is the floor for PEP 639 `license`/`license-files` as an SPDX string.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

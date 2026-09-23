@@ -16,6 +16,10 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY pyproject.toml ./
+# Required by the build, not just good manners: pyproject sets
+# `license-files = ["LICENSE"]`, and setuptools fails the build if the pattern
+# matches nothing.
+COPY LICENSE ./
 COPY src ./src
 # The generic MCP runtime's source is staged *into* the package so the control
 # plane can hand a user the exact code their MCP runs. Nothing here imports it
