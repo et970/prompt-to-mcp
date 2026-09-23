@@ -1,0 +1,22 @@
+# Build context for the container image.
+#
+# This file must exist. Without it gcloud derives its rules from .gitignore,
+# which is not shipped -- so the whole working directory, including anything
+# you created next to this package, is uploaded to your Cloud Build staging
+# bucket and kept there indefinitely.
+.git
+.gitignore
+.venv
+__pycache__
+*.egg-info
+.pytest_cache
+.ruff_cache
+# Credentials and local configuration. These must never reach a build context.
+.env
+.env.*
+*-key.json
+*_key.json
+*.pem
+manifest.json
+# `runtime` is deliberately NOT ignored: the Dockerfile stages it into the
+# package so /v1/mcps/{id}/bundle.zip can ship the code your MCP actually runs.

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>prompt-to-mcp</title>
+<link rel="stylesheet" href="./styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9670;</text></svg>" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">&#9670;</span>
+    <div>
+      <h1>prompt-to-mcp</h1>
+      <p class="sub">Prompt + API docs &rarr; MCP server on Cloud Run &rarr; Agent Registry &rarr; Gemini Enterprise</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="health" class="pill pill-muted">checking&hellip;</span>
+    <!-- The interactive API docs are disabled in production: they were an
+         unauthenticated, indexed map of the attack surface. The link is kept
+         because it works under `make run` locally, where P2M_ALLOW_UNAUTHENTICATED
+         is set and the docs are mounted. -->
+    <a class="link" href="../docs" target="_blank" rel="noopener noreferrer">API docs (local only)</a>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ================= Left: create ================= -->
+  <section class="panel">
+    <h2>Create an MCP server</h2>
+
+    <form id="create-form" autocomplete="off">
+      <label>
+        <span class="label">What should it do?</span>
+        <textarea id="description" rows="2"
+          placeholder="Tools for querying and creating support tickets"></textarea>
+        <small>Used to prioritise which operations become tools. Left blank, it is
+          taken from the documentation where possible.</small>
+      </label>
+
+      <label>
+        <span class="label">API docs, OpenAPI spec, or MCP URL <em>required</em></span>
+        <textarea id="input" rows="4"
+          placeholder="https://api.example.com/openapi.json&#10;&#10;…or an MCP endpoint, a documentation page URL, or paste a spec or docs directly."></textarea>
+        <small>One field. What it is gets worked out automatically &mdash; including
+          whether it describes an MCP server that already exists.</small>
+      </label>
+
+      <div id="analysis" class="preview hidden"></div>
+
+      <div class="actions">
+        <button type="submit" class="btn btn-primary" id="btn-create">Create</button>
+        <span id="analysis-status" class="muted"></span>
+      </div>
+      <p id="form-error" class="error hidden"></p>
+
+      <details id="advanced" class="cfg">
+        <summary>Advanced <span class="muted">overrides for everything inferred above</span></summary>
+        <div class="grid-2">
+          <label>
+            <span class="label">Name</span>
+            <input id="adv-name" type="text" placeholder="derived from the description" />
+          </label>
+          <label>
+            <span class="label">Base URL override</span>
+            <input id="adv-base_url" type="url" placeholder="taken from the spec" />
+          </label>
+        </div>
+        <div class="grid-2">
+          <label>
+            <span class="label">Upstream auth</span>
+            <select id="adv-auth_kind">
+              <option value="">detected automatically</option>
+              <option value="oauth_user">oauth_user &mdash; propagate end-user token</option>
+              <option value="api_key">api_key &mdash; one shared key you supply</option>
+              <option value="none">none &mdash; no credentials</option>
+              <option value="google_id_token">google_id_token &mdash; service identity</option>
+            </select>
+          </label>
+          <label>
+            <span class="label">Scopes</span>
+            <input id="adv-scopes" type="text" placeholder="space separated; usually inferred" />
+          </label>
+        </div>
+        <div class="grid-2">
+          <label>
+            <span class="label">API key</span>
+            <input id="adv-api_key" type="password" autocomplete="off"
+                   placeholder="only for api_key; stored in Secret Manager" />
+          </label>
+          <label>
+            <span class="label">API key header</span>
+            <input id="adv-api_key_header" type="text"
+                   placeholder="inferred per provider, e.g. x-goog-api-key" />
+          </label>
+        </div>
+        <div class="grid-2">
+          <label>
+            <span class="label">Authorization endpoint</span>
+            <input id="adv-authorization_endpoint" type="url" placeholder="discovered" />
+          </label>
+          <label>
+            <span class="label">Token endpoint</span>
+            <input id="adv-token_endpoint" type="url" placeholder="discovered" />
+          </label>
+        </div>
+        <label>
+          <span class="label">Stop after stage</span>
+          <select id="adv-stop_after">
+            <option value="">Run all stages</option>
+            <option value="ingest">ingest &mdash; build the manifest only</option>
+            <option value="deploy">deploy &mdash; stop after Cloud Run</option>
+            <option value="oauth">oauth &mdash; stop after credential setup</option>
+            <option value="register">register &mdash; stop after Agent Registry</option>
+            <option value="authorize">authorize &mdash; stop after the auth resource</option>
+            <option value="connect">connect &mdash; stop after the data store</option>
+          </select>
+        </label>
+      </details>
+    </form>
+  </section>
+
+  <!-- ================= Right: runs ================= -->
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Provisioned servers</h2>
+      <button type="button" class="btn btn-sm" id="btn-refresh">Refresh</button>
+    </div>
+    <div id="mcp-list" class="list"><p class="muted">Loading&hellip;</p></div>
+  </section>
+</main>
+
+<!-- ================= Detail drawer ================= -->
+<div id="drawer" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+  <div class="drawer-inner">
+    <div class="drawer-head">
+      <h2 id="drawer-title">Details</h2>
+      <button type="button" class="btn btn-sm" id="drawer-close" aria-label="Close">Close</button>
+    </div>
+    <div id="drawer-body"></div>
+  </div>
+</div>
+
+<script src="./app.js"></script>
+</body>
+</html>
