@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.0.3
+
+**The UI is reachable from a browser again, through Identity-Aware Proxy.**
+
+1.0.2 made the control plane private and had no way to open it. That was not an
+oversight in the docs; it was structural. The application authenticates callers
+by verifying a bearer token, and **a browser cannot set an `Authorization`
+header**. No amount of being signed in to Google helps, and the documented
+workaround did not work either: `gcloud run services proxy` authenticates
+through `X-Serverless-Authorization`, which [Cloud Run strips the signature
+from](https://cloud.google.com/iap/docs/enabling-cloud-run#known-limitations)
+before the container sees it. `make ui` returned `401 invalid ID token`.
+
+- **IAP assertions are now a first-class credential.** When
+  `X-Goog-IAP-JWT-Assertion` is present it is verified against IAP's key set,
+  with the issuer and the audience checked explicitly, and the resulting email
+  goes through the same `P2M_ALLOWED_PRINCIPALS` allowlist as a bearer token.
+  Authorization is decided in one place regardless of how the caller arrived.
+- **The audience is pinned to this service** —
+  `/projects/<number>/locations/<region>/services/<service>`, derived from
+  `P2M_PROJECT_NUMBER`, `P2M_RUN_REGION` and the new `P2M_SERVICE_NAME`, or set
+  outright with `P2M_IAP_AUDIENCE`. If it cannot be determined, IAP assertions
+  are **refused** rather than accepted unchecked: an assertion proves IAP
+  authenticated someone for *some* resource, and without the resource half, one
+  minted for an unrelated app in an unrelated project would be accepted here.
+- `X-Goog-Authenticated-User-Email` is ignored. It carries the same identity as
+  the assertion but is an unsigned string, so anything reaching the container
+  without passing through IAP can set it.
+
+### BREAKING: `X-Serverless-Authorization` is no longer read
+
+It was in the bearer-header fallback chain, which was actively harmful rather
+than merely useless. Anything behind Cloud Run IAM populates that header on
+every request with a signature-stripped token, so a caller who authenticated
+correctly some other way had their real credential shadowed by a
+guaranteed-invalid one and was told their token was bad. Under IAP it would
+have shadowed every request there is, and the assertion would never have been
+reached.
+
+Send `Authorization` instead; Cloud Run forwards it intact. If you have a
+script sending both headers, it keeps working — the second one was always the
+one doing the work.
+
+`make check-deployed` and `deploy.sh`'s smoke tests now send a single
+`Authorization` header.
+
+### Fixed
+
+- The 1.0.2 claim that Cloud Run "recognises a Google credential in either
+  standard header and substitutes an assertion of its own" was wrong about
+  `Authorization`, which is forwarded untouched. Only
+  `X-Serverless-Authorization` is rewritten. README, CHANGELOG, `deploy.sh` and
+  the 401 message all repeated the incorrect version.
+- The 401 for a credential-less request advised a two-header `curl` that named
+  a header Cloud Run strips and that a browser cannot follow at all. It now
+  points browsers at IAP and everything else at `Authorization`.
+- 1.0.2 said to point external probes at `/healthz` in one place and noted it is
+  unreachable from outside Cloud Run in another. The first is now corrected.
+
 ## 1.0.2
 
 **Two BREAKING security fixes.** Existing deployments will start requiring
@@ -40,28 +99,32 @@ Now:
   reconnaissance summary. All of that moved intact to the authenticated
   `GET /v1/buildinfo`; `make check-deployed` and the UI health pill follow it
   there. **`/healthz` is the only unauthenticated route**, and discloses
-  nothing; point external probes at it.
+  nothing. Note it serves container-level startup probes only — Google Front
+  End intercepts that path before Cloud Run, so it is not reachable from
+  outside; see the note below on where to point external probes.
 - The static UI mount is guarded too. A mount is an ASGI sub-application and
   bypasses route dependencies, so `/ui/app.js` would otherwise have stayed
   readable by anyone.
 
 **Migrating.** `deploy.sh` grants `run.invoker` to whoever runs it and sets
 `P2M_ALLOWED_PRINCIPALS` to the same identity. Both layers must name a caller.
-Open the UI with `gcloud run services proxy prompt-to-mcp` (or `make ui`),
-which attaches your identity token — do not re-add `--allow-unauthenticated`.
+Do not re-add `--allow-unauthenticated`, and do not disable the invoker IAM
+check — the latter is a separate Cloud Run setting that `--no-allow-unauthenticated`
+does not restore, so a service toggled that way reports itself private while
+answering the whole internet.
 
-**Calling it with curl — two traps, both found by deploying this and trying:**
+To open the UI, enable Identity-Aware Proxy (see 1.0.3).
 
-- **Send the token twice** — `X-Serverless-Authorization` for Cloud Run, and
-  **`X-P2M-Authorization`** for the application. Cloud Run recognises a Google
-  credential in either standard header and substitutes an assertion of its own,
-  so the caller's token never reaches the container. Measured on a live service:
-  an 872-character ID token came back as a different 557-character value in all
-  three standard-header arrangements, while 905 characters of JWT-shaped junk
-  passed through untouched — the platform is not truncating or blindly
-  overwriting, it is deliberately withholding the credential. An application
-  behind Cloud Run IAM can therefore only re-verify a caller's token if that
-  token arrives in a header the platform ignores.
+**Calling it with curl:**
+
+- **One header: `Authorization`.** Cloud Run makes its IAM decision from it and
+  forwards it to the container intact, so the same token satisfies the platform
+  and the application. `X-P2M-Authorization` remains as an override for a
+  fronting layer that consumes the standard header.
+- **Not `X-Serverless-Authorization`.** Cloud Run strips that header's signature
+  before the container sees it, so its contents can never verify. Measured on a
+  live service: an 872-character ID token arrived as a 557-character, 3-segment,
+  JWT-shaped value that fails as `MalformedError`.
 - Use a plain `gcloud auth print-identity-token`, with **no** `--audiences`.
   gcloud refuses that flag for user accounts, so a human's token always carries
   gcloud's client ID as its audience; `extra_allowed_audiences` accepts it by

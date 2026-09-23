@@ -162,17 +162,13 @@ if __name__ == "__main__":  # pragma: no cover - build tooling
                 )
                 sys.exit(2)
 
-        # Both headers, same token. X-Serverless-Authorization satisfies Cloud
-        # Run's IAM check; X-P2M-Authorization is what the application verifies.
-        # Cloud Run replaces a Google credential found in either standard header
-        # with an assertion of its own, so a token the app can check has to
-        # arrive in one the platform ignores.
+        # One header. Cloud Run satisfies its IAM check from Authorization and
+        # forwards it to the container intact, so the same token serves both
+        # layers. (X-Serverless-Authorization would not: Cloud Run strips the
+        # signature off that one before the container sees it.)
         request = urllib.request.Request(  # noqa: S310 - https URL supplied by the operator
             f"{url}/v1/buildinfo",
-            headers={
-                "X-Serverless-Authorization": f"Bearer {token}",
-                "X-P2M-Authorization": f"Bearer {token}",
-            },
+            headers={"Authorization": f"Bearer {token}"},
         )
         try:
             with urllib.request.urlopen(request, timeout=30) as resp:  # noqa: S310

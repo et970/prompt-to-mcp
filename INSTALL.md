@@ -170,42 +170,33 @@ OIDC token from the control plane's own service account.
 URL=$(gcloud run services describe prompt-to-mcp \
         --region "$REGION" --format='value(status.url)')
 TOKEN=$(gcloud auth print-identity-token)
-# Twice on purpose: X-Serverless-Authorization for Cloud Run's IAM check,
-# X-P2M-Authorization for the application. Cloud Run replaces a Google
-# credential found in either standard header with an assertion of its own,
-# so the app can only see a token that travels in a header it ignores.
-AUTH=(-H "X-Serverless-Authorization: Bearer $TOKEN" -H "X-P2M-Authorization: Bearer $TOKEN")
+# One header. Cloud Run makes its IAM decision from Authorization and forwards
+# it to the container intact, so the same token satisfies both layers.
+AUTH=(-H "Authorization: Bearer $TOKEN")
 
-curl -s "$URL/healthz"                                 # liveness, unauthenticated
 curl -s "${AUTH[@]}" "$URL/v1/buildinfo" | jq
 curl -s "${AUTH[@]}" "$URL/v1/canary" | jq  # 503 = contract drifted
 ```
 
-### Two things about calling it that will otherwise cost you an hour
+### Three things about calling it that will otherwise cost you an hour
 
-**Send the token twice.** Cloud Run rewrites whichever header it consumed for
-its own IAM check — the container receives a different value in its place, and
-the application's verification then fails on a perfectly good credential with a
-misleading `invalid ID token`. Measured against a live service:
+**A browser cannot reach this service without IAP.** It cannot set an
+`Authorization` header, so it can never present a bearer token. Enable
+Identity-Aware Proxy on the control plane and open `$URL/ui/`; see
+[Opening the web UI](#opening-the-web-ui). `gcloud run services proxy`
+does not work — it authenticates through `X-Serverless-Authorization`.
 
-| `Authorization` contains | `X-Serverless-Authorization` carries | App receives |
-|---|---|---|
-| a valid ID token (872 chars) | nothing | 557 chars |
-| nothing | a valid ID token | 557 chars |
-| a valid ID token | a valid ID token | 557 chars |
-| 905 chars of JWT-shaped junk | a valid ID token | 905 chars, **intact** |
+**Do not send `X-Serverless-Authorization`.** Cloud Run treats it as its own
+transport for the IAM check and [strips its
+signature](https://cloud.google.com/iap/docs/enabling-cloud-run#known-limitations)
+before the container sees it, so the application fails a perfectly good
+credential with a misleading `invalid ID token`. Measured against a live
+service, an 872-character ID token sent that way arrived as 557 characters.
 
-The last row is the informative one: Cloud Run does not truncate and does not
-blindly overwrite. It *recognises* a Google credential and substitutes an
-assertion of its own, so the caller's token never reaches the container in
-either standard header.
-
-So send it twice: **`X-Serverless-Authorization`** for the platform and
-**`X-P2M-Authorization`** for the application, which Cloud Run passes through
-untouched. Every example below uses the `$AUTH` array that sets both. A plain
-`Authorization` still works anywhere Cloud Run is not in front — local
-development, a load balancer, or a deployment that wrongly re-added
-`--allow-unauthenticated`, which is the case this check exists for.
+Send **`Authorization`**; it is forwarded untouched, which the same measurement
+confirms — the request returned 200 with the token verified by the application.
+`X-P2M-Authorization` is still read first, as an override for any fronting
+layer that does consume the standard header.
 
 **Use a plain `gcloud auth print-identity-token`, with no `--audiences`.**
 gcloud refuses that flag for user accounts (*"Invalid account type for
@@ -227,22 +218,50 @@ check. Point external monitoring at `/v1/canary` with an OIDC token instead;
 everything else. It used to return the project id, every region setting, the
 public base URL and the build fingerprint, which made it a free reconnaissance
 summary for anyone who found the URL. All of that moved intact to
-`/v1/buildinfo`. Use `/healthz` for external probes.
+`/v1/buildinfo`.
 
 ### Opening the web UI
 
-The UI is served from the private control plane, so a browser cannot reach it
-directly. Use Cloud Run's local proxy, which attaches your identity token to
-every request:
+The UI is served from the private control plane, and a browser cannot
+authenticate to it on its own: it cannot set an `Authorization` header, so it
+can never present a bearer token. Put **Identity-Aware Proxy** in front, which
+performs the Google sign-in and tells the application who arrived:
 
 ```bash
-gcloud run services proxy prompt-to-mcp --region "$REGION"
-# then open http://localhost:8080/ui/
+gcloud run services update prompt-to-mcp --region "$REGION" --iap
+
+# IAP invokes the service on your behalf, so it needs permission to.
+gcloud run services add-iam-policy-binding prompt-to-mcp --region "$REGION" \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com" \
+  --role=roles/run.invoker
+
+# ...and you need permission to get through IAP.
+gcloud run services add-iam-policy-binding prompt-to-mcp --region "$REGION" \
+  --member="user:$(gcloud config get-value account)" \
+  --role=roles/iap.httpsResourceAccessor
 ```
 
-`make ui` is a shortcut for the same thing. Do **not** re-add
-`--allow-unauthenticated` to get the UI working; that is the vulnerability, not
-a workaround for it.
+Then open `$URL/ui/` and sign in. Three principals must agree: IAP must let you
+through (`roles/iap.httpsResourceAccessor`), Cloud Run must let IAP in
+(`roles/run.invoker` on the IAP service agent), and the application must accept
+your email (`P2M_ALLOWED_PRINCIPALS`).
+
+**Keep the invoker IAM check on.** It is a separate setting from
+`--allow-unauthenticated`, and disabling it — the "Allow public access without
+IAM" toggle in the console — leaves the `run.app` URL directly reachable,
+making IAP decorative. `--no-allow-unauthenticated` does not restore it; use
+`gcloud run services update prompt-to-mcp --region "$REGION" --invoker-iam-check`.
+
+**Only the control plane gets IAP.** The OAuth proxy is a separate service that
+must stay public: end users' browsers are redirected to `/oauth/authorize` and
+upstream providers redirect back to `/oauth/callback`, and IAP in front of
+either would break the consent flow for everyone.
+
+`gcloud run services proxy` (and therefore `make ui`) does **not** work here.
+It authenticates through `X-Serverless-Authorization`, whose signature Cloud Run
+strips, so the application receives a token it cannot verify and returns
+`401 invalid ID token`. Do not reach for `--allow-unauthenticated` when that
+happens; that is the vulnerability, not a workaround for it.
 
 Confirm the running service was built from this source tree:
 
@@ -464,10 +483,21 @@ Leave `P2M_DISCOVERY_ENGINE_LOCATION` at `global`.
 in the `openapi_url` field. Use `url` for documentation pages, or `openapi_url`
 only for machine-readable specs. The service reports this specifically.
 
-**`401 missing bearer token` from every endpoint.** Expected: the control
-plane is private. Send an identity token
-(`gcloud auth print-identity-token`), or use
-`gcloud run services proxy` for the UI.
+**`401 missing credentials` from every endpoint.** Expected: the control plane
+is private. Send `-H "Authorization: Bearer $(gcloud auth print-identity-token)"`.
+From a browser there is nothing to send — enable IAP instead.
+
+**`401 invalid ID token` when you did send one.** Two causes. Either the token
+travelled in `X-Serverless-Authorization`, whose signature Cloud Run strips
+(this is what `gcloud run services proxy` does) — send `Authorization` instead;
+or IAP is enabled and the assertion failed verification, in which case the logs
+name the reason.
+
+**`401 this service cannot verify IAP assertions`.** IAP is in front but the
+expected audience cannot be derived. Set `P2M_PROJECT_NUMBER`, or
+`P2M_IAP_AUDIENCE` to
+`/projects/<number>/locations/<region>/services/<service>` outright. The
+service refuses assertions rather than accepting any audience.
 
 **`403 principal ... is not allowed`.** Your token is valid but your identity is
 not in `P2M_ALLOWED_PRINCIPALS`. Add it, and grant `roles/run.invoker` too —

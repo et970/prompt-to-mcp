@@ -43,9 +43,24 @@ run-mcp:
 
 # The deployed control plane is private, so reach the UI through a local proxy
 # that attaches your identity token. Then open http://localhost:8080/ui/
+# Enable Identity-Aware Proxy, then open the service URL in a browser.
+#
+# NOT `gcloud run services proxy`: it authenticates through
+# X-Serverless-Authorization, whose signature Cloud Run strips before the
+# container sees it, so the app rejects the token it never really received.
 ui:
-	gcloud run services proxy $${SERVICE:-prompt-to-mcp} \
-	  --region $${REGION:-us-central1} --project $${PROJECT_ID:-$$(gcloud config get-value project)}
+	@SERVICE=$${SERVICE:-prompt-to-mcp}; REGION=$${REGION:-us-central1}; \
+	PROJECT_ID=$${PROJECT_ID:-$$(gcloud config get-value project)}; \
+	PROJECT_NUMBER=$$(gcloud projects describe $$PROJECT_ID --format='value(projectNumber)'); \
+	gcloud run services update $$SERVICE --region $$REGION --project $$PROJECT_ID --iap && \
+	gcloud run services add-iam-policy-binding $$SERVICE --region $$REGION --project $$PROJECT_ID \
+	  --member="serviceAccount:service-$$PROJECT_NUMBER@gcp-sa-iap.iam.gserviceaccount.com" \
+	  --role=roles/run.invoker --quiet >/dev/null && \
+	gcloud run services add-iam-policy-binding $$SERVICE --region $$REGION --project $$PROJECT_ID \
+	  --member="user:$$(gcloud config get-value account)" \
+	  --role=roles/iap.httpsResourceAccessor --quiet >/dev/null && \
+	echo "Open $$(gcloud run services describe $$SERVICE --region $$REGION \
+	  --project $$PROJECT_ID --format='value(status.url)')/ui/ and sign in."
 
 canary:
 	curl -fsS -H "Authorization: Bearer $$(gcloud auth print-identity-token \

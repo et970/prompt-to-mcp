@@ -23,6 +23,23 @@ So the same check is made again here, in the application, against the same
 Google-signed ID token. Defence in depth is worth the duplication when the
 failure mode of the outer layer is silent.
 
+Two credentials, because a browser has no bearer token
+------------------------------------------------------
+A browser cannot set an ``Authorization`` header, so it can never satisfy a
+bearer check -- no amount of being signed in to Google helps. Opening the UI
+therefore requires something in front that authenticates the human and tells
+the application who they are, which is Identity-Aware Proxy.
+
+Two credential types are accepted, in this order:
+
+* an **IAP assertion** (``X-Goog-IAP-JWT-Assertion``), which is how a browser
+  arrives once IAP is enabled on the service;
+* a **Google-signed OIDC ID token** in a bearer header, which is how ``curl``,
+  CI and ``make check-deployed`` arrive.
+
+Both end at the same allowlist check, so authorization is decided in one place
+regardless of how the caller authenticated.
+
 Fail closed
 -----------
 An empty ``allowed_principals`` denies everyone. It is tempting to treat "no
@@ -225,6 +242,122 @@ def verify_id_token(token: str, settings: Settings, *, source: str = "authorizat
     return Principal(email=email, subject=subject, claims=claims)
 
 
+def _unverified_claim(token: str, name: str) -> Any:
+    """Read one claim without verifying anything. Diagnostics only.
+
+    Never use the result for a decision: the payload of an unverified JWT is
+    attacker-controlled. It exists so a rejected assertion can say *why* in a
+    log line instead of leaving an operator to guess.
+    """
+    import base64
+    import json
+
+    try:
+        payload = token.split(".")[1]
+        padded = payload + "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded)).get(name)
+    except Exception:  # noqa: BLE001 - a malformed token is the normal case here
+        return None
+
+
+def verify_iap_assertion(token: str, settings: Settings) -> Principal:
+    """Verify an Identity-Aware Proxy JWT assertion, or raise 401.
+
+    This is the browser path. A browser cannot set an ``Authorization`` header,
+    so it can never present a bearer token; IAP performs the Google sign-in in
+    front of Cloud Run and states the result in a signed assertion.
+
+    Three checks, none of them optional:
+
+    * **Signature**, against IAP's own key set. These are not the certificates
+      that sign OIDC ID tokens, which is why this cannot reuse
+      :func:`verify_id_token`.
+    * **Audience**, naming this exact Cloud Run service. An assertion proves
+      "IAP authenticated this person for *some* resource"; without pinning the
+      resource, an assertion minted for an unrelated IAP-protected app in an
+      unrelated project would be accepted here.
+    * **Issuer**, which ``verify_token`` does not check for us.
+
+    The ``X-Goog-Authenticated-User-Email`` header carries the same identity
+    and is deliberately ignored: it is a plain unsigned string, so anything
+    that reaches the container without going through IAP can set it freely.
+    """
+    import google.auth.transport.requests
+    import google.oauth2.id_token
+    from google.auth.exceptions import GoogleAuthError
+
+    audience = settings.expected_iap_audience
+    if not audience:
+        # Fail closed. The alternative -- skipping the audience check when it
+        # cannot be derived -- turns a missing config value into "accept any
+        # IAP assertion from anywhere", which is the failure this check exists
+        # to prevent.
+        log.warning(
+            "received an IAP assertion but no audience is configured. Set "
+            "P2M_PROJECT_NUMBER (preferred) or P2M_IAP_AUDIENCE to "
+            "/projects/<number>/locations/<region>/services/<service>."
+        )
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "this service cannot verify IAP assertions: no expected audience "
+                "is configured. Set P2M_PROJECT_NUMBER or P2M_IAP_AUDIENCE."
+            ),
+        )
+
+    try:
+        claims: dict[str, Any] = google.oauth2.id_token.verify_token(
+            token,
+            google.auth.transport.requests.Request(),
+            audience=audience,
+            certs_url=IAP_CERTS_URL,
+        )
+    except (GoogleAuthError, ValueError) as exc:
+        # Report the audience we were offered alongside the one we wanted.
+        #
+        # An audience mismatch and a bad signature raise the same exception
+        # type, and they have nothing in common as problems: one is a
+        # configuration error that every request will repeat, the other is an
+        # attack or a key rotation. Without the two values side by side the
+        # operator's only evidence is "IAP says you are signed in, the app says
+        # you are not". The claims are read *unverified* and used for nothing
+        # but this log line.
+        log.info(
+            "IAP assertion rejected: %s (%d chars, %d segments, aud=%r, iss=%r, "
+            "expected aud=%r)",
+            type(exc).__name__,
+            len(token),
+            token.count(".") + 1,
+            _unverified_claim(token, "aud"),
+            _unverified_claim(token, "iss"),
+            audience,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "invalid IAP assertion: not a valid, unexpired assertion for "
+                "this service"
+            ),
+        ) from exc
+
+    issuer = claims.get("iss")
+    if issuer != IAP_ISSUER:
+        log.info("IAP assertion issuer mismatch: %r", issuer)
+        raise HTTPException(status_code=401, detail="IAP assertion has an unexpected issuer")
+
+    # For Google identities `email` is a bare address and `sub` is prefixed
+    # with `accounts.google.com:`. The allowlist is written in addresses, so a
+    # token without one cannot be authorized no matter what else it carries --
+    # which is also the correct outcome for Identity Platform identities, whose
+    # email claim is prefixed and will not match.
+    email = claims.get("email")
+    if not email:
+        raise HTTPException(
+            status_code=401, detail="IAP assertion carries no email claim"
+        )
+    return Principal(email=email, subject=str(claims.get("sub") or ""), claims=claims)
+
+
 def check_allowed(principal: Principal, settings: Settings) -> None:
     """Authorize a verified principal, or raise 403.
 
@@ -283,38 +416,46 @@ EXEMPT_PATHS: frozenset[str] = frozenset({"/healthz"})
 
 #: Headers a bearer token may arrive in, in priority order.
 #:
-#: The first entry is a custom header, and that is not arbitrary. Cloud Run
-#: actively prevents a backend from seeing the caller's ID token, and it took
-#: four measurements against a live service to establish the shape of it:
+#: ``X-Serverless-Authorization`` is deliberately **absent**, and that is the
+#: whole subtlety of this list.
 #:
-#:   ====================================  =========================  ==========
-#:   Authorization contains                X-Serverless-Auth carries  app sees
-#:   ====================================  =========================  ==========
-#:   a valid Google ID token (872 chars)   nothing                    557 chars
-#:   nothing                               a valid ID token           557 chars
-#:   a valid ID token                      a valid ID token           557 chars
-#:   905 chars of JWT-shaped junk          a valid ID token           905 chars
-#:   ====================================  =========================  ==========
+#: Cloud Run treats that header as its own transport for the IAM check, and
+#: documents what it does with it: "Cloud Run passes this header to your
+#: service after stripping its signature."[1] The container therefore receives
+#: a JWT-shaped value -- three segments, correct prefix, ~557 characters -- that
+#: can never verify. Measured against a live service, an 872-character ID token
+#: sent in that header arrived as 557 characters and failed as ``MalformedError``.
 #:
-#: The last row is the informative one. Cloud Run does not truncate, and it does
-#: not blindly overwrite -- arbitrary content passes through untouched. It
-#: *recognises* a Google-issued credential and replaces it with an assertion of
-#: its own (a 557-character value that is not a verifiable OIDC ID token). The
-#: caller's token is consumed by the platform and never reaches the container,
-#: whichever standard header it travelled in.
+#: Listing it as a fallback is worse than useless. Anything fronted by Cloud Run
+#: IAM populates it on *every* request, so a caller who correctly authenticated
+#: some other way would have their real credential ignored in favour of a
+#: guaranteed-invalid one, and be told their token was bad. Under IAP that is
+#: permanent: IAP authenticates to Cloud Run through this very header, so every
+#: IAP request carries a stripped token and the IAP assertion would never be
+#: reached.
 #:
-#: So an application behind Cloud Run IAM cannot re-verify the caller's token
-#: from ``Authorization`` or ``X-Serverless-Authorization``. It can only do so
-#: from a header Cloud Run has no interest in -- hence
-#: ``X-P2M-Authorization``, which is passed through verbatim.
+#: ``Authorization`` *is* forwarded intact -- verified against a live private
+#: service, where a plain ``Authorization: Bearer <id-token>`` both satisfied
+#: Cloud Run's IAM check and arrived verifiable. It is the normal case.
+#: ``X-P2M-Authorization`` is kept ahead of it as an explicit override for any
+#: future platform that does consume the standard header.
 #:
-#: The other two remain as fallbacks, and they are the normal case whenever
-#: Cloud Run is *not* in front: local development, a load balancer, another
-#: platform, or a deployment that has wrongly re-added
-#: ``--allow-unauthenticated``. That last one is the whole reason this check
-#: exists, and it is precisely the case where nothing rewrites the header and a
-#: plain ``Authorization`` works.
-BEARER_HEADERS = ("x-p2m-authorization", "authorization", "x-serverless-authorization")
+#: [1] https://cloud.google.com/iap/docs/enabling-cloud-run#known-limitations
+BEARER_HEADERS = ("x-p2m-authorization", "authorization")
+
+#: Header carrying IAP's signed statement about the end user.
+#:
+#: Distinct from the bearer headers because it is not a bearer credential: it
+#: has no ``Bearer`` prefix, a different issuer, a different key set and a
+#: different audience format.
+IAP_ASSERTION_HEADER = "x-goog-iap-jwt-assertion"
+
+#: Issuer of every IAP assertion.
+IAP_ISSUER = "https://cloud.google.com/iap"
+
+#: IAP's signing keys. A distinct key set from Google's OIDC certificates,
+#: which is why the assertion cannot be checked with ``verify_oauth2_token``.
+IAP_CERTS_URL = "https://www.gstatic.com/iap/verify/public_key"
 
 
 def _bearer_token(request: Request) -> tuple[str, str]:
@@ -355,18 +496,29 @@ async def authenticate(request: Request) -> Principal:
 
     settings = settings_for(request)
 
+    # IAP first. When it is in front, every request carries an assertion, and
+    # a browser has nothing else to offer -- it cannot set a bearer header at
+    # all. Checking it first also keeps the bearer branch's error messages
+    # about bearer tokens, rather than reporting "missing bearer token" to a
+    # user who authenticated perfectly well by signing in to Google.
+    assertion = request.headers.get(IAP_ASSERTION_HEADER, "").strip()
+    if assertion:
+        principal = verify_iap_assertion(assertion, settings)
+        check_allowed(principal, settings)
+        request.state.principal = principal
+        return principal
+
     token, source = _bearer_token(request)
     if not token:
         raise HTTPException(
             status_code=401,
             detail=(
-                "missing bearer token. Behind Cloud Run send the ID token in "
-                "X-P2M-Authorization as well as X-Serverless-Authorization: "
-                "Cloud Run consumes the standard headers for its own IAM check "
-                "and the application never sees what you sent. "
-                "TOKEN=$(gcloud auth print-identity-token); curl "
-                "-H \"X-Serverless-Authorization: Bearer $TOKEN\" "
-                "-H \"X-P2M-Authorization: Bearer $TOKEN\""
+                "missing credentials. From a browser, reach this service through "
+                "Identity-Aware Proxy. Programmatically, send a Google-signed ID "
+                "token: TOKEN=$(gcloud auth print-identity-token); curl -H "
+                '"Authorization: Bearer $TOKEN" <url>. Use X-P2M-Authorization '
+                "instead if something in front of this service consumes the "
+                "standard header."
             ),
             headers={"WWW-Authenticate": "Bearer"},
         )

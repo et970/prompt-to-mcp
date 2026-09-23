@@ -1,6 +1,6 @@
 [project]
 name = "prompt-to-mcp"
-version = "1.0.2"
+version = "1.0.3"
 description = "Turn a prompt + API docs into a deployed, registered, Gemini-Enterprise-connected MCP server."
 requires-python = ">=3.11"
 license = "Apache-2.0"

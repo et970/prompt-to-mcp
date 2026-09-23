@@ -33,10 +33,11 @@ account that can create Cloud Run services, act as other service accounts, read
 every secret in the project and administer Discovery Engine. One unauthenticated
 call to `POST /v1/mcps` is arbitrary workload execution in your project.
 `deploy.sh` now deploys it **private**, and the application independently
-verifies a Google-signed ID token against `P2M_ALLOWED_PRINCIPALS`, so it fails
-closed even if ingress is later misconfigured. `/docs` and `/openapi.json` are
-disabled outside local development. Reach the UI with
-`gcloud run services proxy`, never by re-adding `--allow-unauthenticated`.
+verifies the caller against `P2M_ALLOWED_PRINCIPALS` — either a Google-signed
+ID token or an Identity-Aware Proxy assertion — so it fails closed even if
+ingress is later misconfigured. `/docs` and `/openapi.json` are disabled
+outside local development. Reach the UI through [IAP](#opening-the-ui-in-a-browser),
+never by re-adding `--allow-unauthenticated` or disabling the invoker IAM check.
 
 **The OAuth proxy is a separate, deliberately public service.** It has to be:
 the end user's browser is redirected to `/oauth/authorize` and the upstream
@@ -321,13 +322,44 @@ private:
 URL=$(gcloud run services describe prompt-to-mcp --region us-central1 \
         --format='value(status.url)')
 TOKEN=$(gcloud auth print-identity-token)
-# Twice on purpose: X-Serverless-Authorization for Cloud Run's IAM check,
-# X-P2M-Authorization for the application. Cloud Run replaces a Google
-# credential found in either standard header with an assertion of its own,
-# so the app can only see a token that travels in a header it ignores.
-AUTH=(-H "X-Serverless-Authorization: Bearer $TOKEN" -H "X-P2M-Authorization: Bearer $TOKEN")
+# One header. Cloud Run makes its IAM decision from Authorization and forwards
+# it to the container intact, so the same token satisfies both layers.
+AUTH=(-H "Authorization: Bearer $TOKEN")
 # ...then add:  "${AUTH[@]}" to each curl
 ```
+
+### Opening the UI in a browser
+
+A browser cannot set an `Authorization` header, so it can never present a
+bearer token — being signed in to Google does not help. Reaching the UI needs
+something in front that authenticates the person and tells the application who
+they are, which is **Identity-Aware Proxy**:
+
+```bash
+gcloud run services update prompt-to-mcp --region us-central1 --iap
+gcloud run services add-iam-policy-binding prompt-to-mcp --region us-central1 \
+  --member=serviceAccount:service-PROJECT_NUMBER@gcp-sa-iap.iam.gserviceaccount.com \
+  --role=roles/run.invoker
+gcloud run services add-iam-policy-binding prompt-to-mcp --region us-central1 \
+  --member=user:you@example.com --role=roles/iap.httpsResourceAccessor
+```
+
+Then open `$URL/ui/` and sign in. IAP forwards a signed assertion in
+`X-Goog-IAP-JWT-Assertion`; the application verifies its signature, issuer and
+audience, then checks the email against `P2M_ALLOWED_PRINCIPALS` — the same
+allowlist the bearer path uses. Both IAP and the allowlist must name you.
+
+Two things that are not optional. The invoker IAM check must stay **on**
+(`--invoker-iam-check`): with it disabled the `run.app` URL is reachable
+directly and IAP is decorative. And IAP belongs on the control plane **only** —
+putting it in front of the OAuth proxy breaks the consent flow for every end
+user, which is the reason the two are separate services.
+
+`gcloud run services proxy` does **not** work. It authenticates through
+`X-Serverless-Authorization`, and [Cloud Run strips that header's
+signature](https://cloud.google.com/iap/docs/enabling-cloud-run#known-limitations)
+before the container sees it, so the application receives a token that cannot
+verify. Plain `Authorization`, by contrast, arrives intact.
 
 ### Two modes
 

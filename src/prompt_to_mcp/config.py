@@ -127,6 +127,29 @@ class Settings(BaseSettings):
     #: that was forgotten cannot silently publish the API.
     allowed_principals: CommaSeparated = Field(default_factory=list)
 
+    #: Cloud Run service name, used only to derive :attr:`iap_audience`.
+    #:
+    #: Defaults to the name ``deploy.sh`` uses. It exists as a setting because a
+    #: renamed service silently breaks the IAP audience check, and a wrong
+    #: audience is indistinguishable from a forged assertion.
+    service_name: str = "prompt-to-mcp"
+
+    #: Expected ``aud`` of an IAP JWT assertion, or ``None`` to derive it.
+    #:
+    #: Identity-Aware Proxy is the only way a *browser* can reach this service.
+    #: The application cannot authenticate a browser itself: it requires a
+    #: bearer token in a header, and a browser cannot set one. IAP performs the
+    #: Google sign-in, then forwards the request with a signed assertion in
+    #: ``X-Goog-IAP-JWT-Assertion`` that names the user.
+    #:
+    #: The audience binds the assertion to *this* service. Without checking it,
+    #: an assertion minted by IAP for any other resource in any project would be
+    #: accepted here. For IAP enabled directly on Cloud Run the format is
+    #: ``/projects/<number>/locations/<region>/services/<service>``; deriving it
+    #: needs ``project_number``, so setting it explicitly is the escape hatch
+    #: when that is unavailable.
+    iap_audience: str | None = None
+
     #: Firestore database id holding MCP records and OAuth client state.
     firestore_database: str = "(default)"
 
@@ -220,6 +243,25 @@ class Settings(BaseSettings):
             "serviceAccount:service-"
             f"{self.project_number}@gcp-sa-discoveryengine.iam.gserviceaccount.com"
         ]
+
+    @property
+    def expected_iap_audience(self) -> str | None:
+        """The ``aud`` an IAP assertion must carry, or ``None`` if unknowable.
+
+        ``None`` disables the IAP path entirely rather than accepting any
+        audience. An assertion is a Google signature over "IAP authenticated
+        this person for *that* resource"; without the resource half, a valid
+        assertion from an unrelated IAP-protected app in an unrelated project
+        would authenticate here.
+        """
+        if self.iap_audience:
+            return self.iap_audience
+        if not self.project_number:
+            return None
+        return (
+            f"/projects/{self.project_number}/locations/"
+            f"{self.run_region}/services/{self.service_name}"
+        )
 
     @property
     def agent_registry_parent(self) -> str:

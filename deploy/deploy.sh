@@ -135,7 +135,7 @@ deploy() {
     --service-account "${SA}" \
     --no-allow-unauthenticated \
     --memory 1Gi --cpu 1 --timeout 3600 --max-instances 5 \
-    --set-env-vars "^|^P2M_PROJECT_ID=${PROJECT_ID}|P2M_PROJECT_NUMBER=${PROJECT_NUMBER}|P2M_RUN_REGION=${REGION}|P2M_AGENT_REGISTRY_LOCATION=${AGENT_REGISTRY_LOCATION}|P2M_DISCOVERY_ENGINE_LOCATION=global|P2M_ARTIFACT_REPO=${REPO}|P2M_RUNTIME_IMAGE=${RUNTIME_LATEST}|P2M_MCP_SERVICE_ACCOUNT=${SA}|P2M_MANIFEST_BUCKET=${MANIFEST_BUCKET}|P2M_PUBLIC_BASE_URL=${public_url}|P2M_OAUTH_BASE_URL=${OAUTH_URL}|P2M_ALLOWED_PRINCIPALS=${ALLOWED_PRINCIPALS}" \
+    --set-env-vars "^|^P2M_PROJECT_ID=${PROJECT_ID}|P2M_PROJECT_NUMBER=${PROJECT_NUMBER}|P2M_RUN_REGION=${REGION}|P2M_AGENT_REGISTRY_LOCATION=${AGENT_REGISTRY_LOCATION}|P2M_DISCOVERY_ENGINE_LOCATION=global|P2M_ARTIFACT_REPO=${REPO}|P2M_RUNTIME_IMAGE=${RUNTIME_LATEST}|P2M_MCP_SERVICE_ACCOUNT=${SA}|P2M_MANIFEST_BUCKET=${MANIFEST_BUCKET}|P2M_PUBLIC_BASE_URL=${public_url}|P2M_OAUTH_BASE_URL=${OAUTH_URL}|P2M_ALLOWED_PRINCIPALS=${ALLOWED_PRINCIPALS}|P2M_SERVICE_NAME=${SERVICE}" \
     --quiet
 }
 
@@ -211,20 +211,27 @@ interactive API docs are disabled. Both are deliberate: this service acts as a
 service account that can create Cloud Run services and write Secret Manager
 versions.
 
-Open the UI in a browser:
-  gcloud run services proxy ${SERVICE} --region ${REGION} --project ${PROJECT_ID}
-  # then http://localhost:8080/ui/  -- the proxy attaches your identity token
+Open the UI in a browser -- enable Identity-Aware Proxy:
+  gcloud run services update ${SERVICE} --region ${REGION} --project ${PROJECT_ID} --iap
+  gcloud run services add-iam-policy-binding ${SERVICE} --region ${REGION} \\
+    --member=serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com \\
+    --role=roles/run.invoker
+  gcloud run services add-iam-policy-binding ${SERVICE} --region ${REGION} \\
+    --member=user:YOU@example.com --role=roles/iap.httpsResourceAccessor
+  # then open ${URL}/ui/ and sign in
 
-Reaching it with curl -- send the token TWICE, in these two headers.
-X-Serverless-Authorization is what Cloud Run checks; X-P2M-Authorization is
-what the application checks. Cloud Run replaces a Google credential found in
-Authorization or X-Serverless-Authorization with an assertion of its own, so a
-token the app can verify has to travel in a header the platform ignores.
+A browser cannot set an Authorization header, so it can never present a bearer
+token and IAP is the only way it reaches this service. \`gcloud run services
+proxy\` does NOT work: it authenticates through X-Serverless-Authorization, and
+Cloud Run strips that header's signature before the container sees it.
+
+Reaching it with curl -- one header. Cloud Run checks Authorization for its own
+IAM decision and forwards it to the container intact, so one token serves both.
 A plain \`gcloud auth print-identity-token\` is correct for a human; gcloud
 refuses --audiences for user accounts.
 
   TOKEN=\$(gcloud auth print-identity-token)
-  AUTH=(-H "X-Serverless-Authorization: Bearer \$TOKEN" -H "X-P2M-Authorization: Bearer \$TOKEN")
+  AUTH=(-H "Authorization: Bearer \$TOKEN")
 
 Smoke test:
   curl -s "\${AUTH[@]}" ${URL}/v1/buildinfo | jq
