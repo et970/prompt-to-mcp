@@ -91,13 +91,16 @@ upstream. Upstream tokens pass through unmodified, which is exactly what makes
 end-to-end credential propagation work: the token Gemini Enterprise stores is
 the token the MCP server forwards to the upstream API.
 
-## What was verified vs. inferred
+## Working against the v1alpha APIs
 
-This project was built by introspecting the live v1alpha discovery documents and
-by reading working resources out of a real project, rather than from
-documentation. Confidence is marked honestly throughout the code.
+Agent Registry and the Discovery Engine connector surface are v1alpha, and the
+parts that matter most here are undocumented: `params` and `actionParams` are
+untyped `map<string, any>` fields that no discovery document describes. The
+contract below was established by introspecting the live discovery documents
+and by reading working resources out of a real project. It is recorded here
+because it is not available anywhere else, and because it will change.
 
-**Verified against live APIs**
+**Established from the discovery documents and live resources**
 
 | Fact | Source |
 |---|---|
@@ -114,38 +117,36 @@ documentation. Confidence is marked honestly throughout the code.
 | `Agent.authorizationConfig` = `{agentAuthorization, toolAuthorizations[]}` | discovery doc |
 | `services.create` takes `?serviceId=`, returns an **LRO**, and the derived `mcpServers/*` echoes tools and annotations back | **live round-trip** |
 
-The Agent Registry body this project generates was validated by actually
-creating a service in a live project, reading back the derived read-only
-`mcpServers/*` projection (tools and annotations echoed correctly, URN minted),
-and deleting it again.
+The Agent Registry body this project generates was validated by creating a
+service in a live project, reading back the derived read-only `mcpServers/*`
+projection (tools and annotations echoed correctly, URN minted), and deleting
+it again.
 
-**Confirmed by a real provisioning run**
+**Behaviour the discovery documents do not describe**
 
-The pipeline has been deployed and run end to end in a live project, reaching
-`state: READY` with a working MCP server, an Agent Registry entry, and a Gemini
-Enterprise data store. That run corrected several things reading the API alone
-got wrong:
+The pipeline has been run end to end in a live project, reaching `state: READY`
+with a working MCP server, an Agent Registry entry and a Gemini Enterprise data
+store. These are the behaviours that only that run could establish, and the
+ones most likely to cost you an afternoon:
 
-| Correction | Detail |
+| Behaviour | Detail |
 |---|---|
 | `DataConnector.connectorType` is **output-only** | Derived from `dataSource`. Sending it is an invalid write. |
 | `params` is **write-different-from-read** | Create takes exactly `{"oauth_access_token": "..."}` in every auth mode. Anything else fails with *"Data Connector parameters must be one of: oauth_access_token"*; omitting it fails with *"Missing Parameter Private App Access Token"*. After creation the backend **discards the token and substitutes `instance_uri`** — so the shape you read back cannot be replayed into a create. |
 | `setUpDataConnector`'s LRO is **not retrievable** | It returns `.../operations/create-data-connector-sync-lro-*`, which `GET`s as 404 while the connector still reaches `ACTIVE`. Poll the connector resource, not the operation. |
-| `actionParams` takes OAuth config **all-or-nothing** | This one cost an outage by being read wrong. A *partial* OAuth group is rejected with *"Data Connector parameters must be one of: instance_uri, use_agent_gateway_egress, agent_gateway_engine, tool_list, mcp_server_source, registry_mcp_server_name but got: auth_uri_params"* — which names one arbitrary key and looks like a blanket ban on OAuth keys. It is not: that list is a **fallback**, used only when no complete group is present. A complete group (`auth_type`, `client_id`, `auth_uri`, `token_uri`; `client_secret`, `scopes`, `auth_uri_params` optional) is accepted even though none of those keys appear in it. Verified key by key against the live API — see the table in `OAUTH_ACTION_PARAMS`. |
+| `actionParams` takes OAuth config **all-or-nothing** | A *partial* OAuth group is rejected with *"Data Connector parameters must be one of: instance_uri, use_agent_gateway_egress, agent_gateway_engine, tool_list, mcp_server_source, registry_mcp_server_name but got: auth_uri_params"* — which names one arbitrary key and looks like a blanket ban on OAuth keys. It is not: that list is a **fallback**, used only when no complete group is present. A complete group (`auth_type`, `client_id`, `auth_uri`, `token_uri`; `client_secret`, `scopes`, `auth_uri_params` optional) is accepted even though none of those keys appear in it. Verified key by key against the live API — see the table in `OAUTH_ACTION_PARAMS`. |
 | `auth_type` must be **explicit** | Omitting it is not neutral: the server defaults it to `OAUTH` and then rejects the connector for lacking credentials. Every connector sets `auth_type`, `NO_AUTH` included. |
 | `params must contain client_id` **names the wrong field** | Sending `client_id` in `params` fails with *"must be one of: oauth_access_token but got: client_id"*; omitting it fails with *"For auth_type: OAUTH, Connector params must contain client_id"*. The field looks simultaneously required and forbidden. It is neither — the complaint is about an incomplete OAuth group in `actionParams`. `_explain` rewrites this message so it never reaches a user as-is. |
 
 **The connector request is negotiated, not hardcoded**
 
-`params` and `actionParams` are untyped `map<string, any>` fields on a v1alpha
-surface. No discovery document describes them, their validation is
-order-dependent, and their error messages name the wrong field often enough
-that transcribing them literally is how this codebase acquired its worst bug.
-No test could have caught that: the suite pins what we send, not what the
-server accepts.
+Validation of those untyped fields is order-dependent, and the error messages
+routinely name the wrong field — so a hardcoded request body transcribed from
+them is wrong in ways no test can catch, because a test suite pins what the
+client sends, not what the server accepts.
 
-So the shape is treated as negotiable. `set_up_mcp_connector` sends its best
-current guess, and when the API names a field it wants changed, amends the
+The shape is therefore treated as negotiable. `set_up_mcp_connector` sends its
+best current guess, and when the API names a field it wants changed, amends the
 request and resends — up to `MAX_PARAM_NEGOTIATION_ATTEMPTS` times. Both
 directions are handled: `parse_missing_params` reads keys to add,
 `parse_param_rejection` reads keys to drop. Values come from a `param_pool` of
@@ -181,20 +182,19 @@ whose only remaining complaint is the missing token has passed every parameter
 check, so it *proves* the shape is valid. A shape the agent did not prove this
 way is downgraded, not reported.
 
-The agent is seeded before it reasons: connectors already `ACTIVE` in the
-project, plus baseline probes of the shapes the app itself sends. That is not a
-convenience. The first version was merely *told* to read working connectors,
-didn't, guessed, and proposed moving the OAuth fields into `params` — the exact
-opposite of the truth. The evidence gate caught it (`verified: false`), but the
-finding was useless. Grounded in a worked example, it now reaches the right
-rule in three probes; the same investigation took fifteen by hand.
+The agent is seeded before it reasons, with connectors already `ACTIVE` in the
+project plus baseline probes of the shapes the app itself sends. Grounding it
+in a worked example rather than instructing it to go and find one is load
+bearing: without the seed it guesses, and the evidence gate then correctly
+marks the result `verified: false` — sound, but useless. Seeded, it reaches the
+right rule in about three probes.
 
 What it deliberately does not do is provision. The eight pipeline stages are
 deterministic, idempotent and resumable, and nondeterminism there would cost
 the progress timeline and the resume semantics while buying nothing. The agent
 sits underneath a pipeline that stays boring.
 
-**Debugging a run**
+**Inspecting what a run actually sent**
 
 Every record carries the inputs and the derived configuration that produced it,
 per stage, under *Provisioned servers → (click a server) → Configuration*:
@@ -204,7 +204,7 @@ body. The body is recorded *before* the call, so a stage that 400s leaves behind
 exactly what it sent. Secrets appear as a `***<sha256 prefix> (n chars)`
 fingerprint — comparable between runs, not recoverable.
 
-**IAM, learned the hard way**
+**IAM roles that are not obvious**
 
 - Agent Registry has its **own** IAM surface. `roles/aiplatform.user` does *not*
   grant `agentregistry.services.create`, despite the shared Vertex branding.
@@ -227,16 +227,9 @@ fingerprint — comparable between runs, not recoverable.
   and v1beta1). It works, but depending on it is a risk. This project points
   Gemini Enterprise at the Cloud Run URL directly instead.
 
-**Still unproven**
-
-- The browser consent flow through the OAuth proxy. Every endpoint is unit
-  tested and live-reachable, but no real user has walked the redirect chain.
-- Attaching to a Gemini Enterprise app (`attach` stage) — needs an existing
-  engine ID, which this project had none of.
-
 ## SDK and packaging traps
 
-Three bugs that only a real deployment surfaces, all now covered by tests:
+Three failures that only a real deployment surfaces, all now covered by tests:
 
 - **`mcp` 2.x changes the meaning of `transport_security=None`.** It is not
   "disabled": `streamable_http_app` defaults `host="127.0.0.1"` and
@@ -272,14 +265,14 @@ access of its own: every request must carry a bearer token the upstream API
 independently validates. Those are published to `allUsers`, and that is
 defensible, because reaching them yields nothing.
 
-It was **not** true for the other two, and 1.0.1 published them anyway. An
-`api_key` server holds your key in Secret Manager and attaches it to every
-outbound request with no inbound check at all; an `auth_kind: "none"` server
-relays anywhere with no check. Both are now deployed private, with
-`run.invoker` granted to a named caller — by default the Gemini Enterprise
-service agent. `deployer/cloud_run.py` spells out which kind is which and why,
-because the version of this paragraph that used to live there would have
-persuaded a reviewer that a real exposure was safe.
+It is **not** true for the other two. An `api_key` server holds your key in
+Secret Manager and attaches it to every outbound request with no inbound check
+at all; an `auth_kind: "none"` server relays anywhere with no check. Publishing
+either to `allUsers` makes it an open proxy onto your credential, which is what
+1.0.1 did. Both are now deployed private, with `run.invoker` granted to a named
+caller — by default the Gemini Enterprise service agent.
+`deployer/cloud_run.py` records which kind is which and why the distinction
+matters.
 
 ## Web UI
 
@@ -480,7 +473,7 @@ Two rejections, both preferring a clear error to a quiet wrong answer:
 ### Preflight: what the app does for you, and what it can't
 
 `POST /v1/preflight` (UI: **What do I need?**) reports every prerequisite,
-classified honestly:
+classified by who has to act:
 
 | Status | Meaning |
 |---|---|
@@ -532,12 +525,11 @@ make check-deployed P2M_URL=https://...      # exit 1 if the deployment is stale
 ```
 
 `/v1/buildinfo` reports a content fingerprint of the source tree the image was
-built from, stamped in by `deploy.sh`. (It was `/readyz` until 1.0.2, where it
-was disclosing the project id and region config to anyone who asked.) This exists because a fix was once written,
-tested and reported as done without ever being deployed; the next run failed
-identically, and an hour went into re-diagnosing a bug that was already fixed.
-The check answers that in one call, and runs as a `live` test when `P2M_URL` is
-set.
+built from, stamped in by `deploy.sh`, so "is the running service this code?"
+is answerable in one call rather than inferred from whether the bug reproduced.
+It lived on `/readyz` until 1.0.2, which also disclosed the project id and
+region configuration to unauthenticated callers. The check runs as a `live`
+test when `P2M_URL` is set.
 
 ### When a run stops part-way
 
@@ -632,18 +624,19 @@ Tests target what actually carries risk rather than line count:
   truncated doc source.
 - **Canary** — reading the live contract out of a rejection, catching a dropped
   or newly required param, and never creating a resource while doing it.
-
-These last three cover the failure mode the rest of the suite structurally
-cannot: the API changing under code that did not. Only `make test-live` can
-actually observe that, which is why it exists.
 - **Pipeline** — all eight stages against fakes, including the secret and URL
   handoffs between stages, correct stage attribution on failure, and the
   `NameError` trap when the very first stage fails.
 - **Dependencies** — every third-party import in `src/` and `runtime/` must be
   declared, implicit runtime deps must be present, and declared-but-unused deps
-  are flagged. Written after `python-multipart` killed the first deploy.
+  are flagged. An undeclared `python-multipart` kills the container at import
+  time, and dev environments hide it by supplying it transitively.
 - **Transport** — a Cloud Run style `Host` header must not be rejected with
   421, which reproduces the mcp 2.x default exactly.
+
+API bodies, connector negotiation and canary cover the failure mode the rest of
+the suite structurally cannot: the API changing underneath code that did not.
+Only `make test-live` can observe that, which is why it exists separately.
 
 ## Layout
 
@@ -684,36 +677,43 @@ runtime/
   server.py              the generic manifest-driven MCP server (mcp 2.x)
 ```
 
-## Caveats
+## Limitations
+
+**Design constraints**
 
 - Everything here rides on **v1alpha** APIs. They will change.
 - Written against **mcp 2.x**; the 1.x decorator API (`@server.list_tools()`) is
   not compatible.
+- Only APIs reachable over HTTP can be wrapped. An SDK that speaks gRPC, holds
+  a websocket, or does real work locally has no HTTP operation to describe.
 - Deleting an MCP detaches its data store from any Gemini Enterprise app and
-  then removes the collection. Anything it genuinely could not remove is
-  reported in `manual_cleanup_required`.
+  then removes the collection. Anything it could not remove is reported in
+  `manual_cleanup_required`.
 - Provisioning runs as an in-process background task. For production scale,
   move it to Cloud Tasks or Workflows so a cold-start eviction cannot orphan a
-  half-finished run — though such a run is now resumable rather than lost.
-- **The browser consent flow is unproven in production.** Everything up to the
-  upstream redirect is verified live, and the token exchange is covered by 14
-  hermetic adversarial tests, but no real user has completed a consent against
-  the deployment.
-- **Per-user token propagation is unproven.** Whether Gemini Enterprise forwards
-  a user's token through the proxy to the MCP server at query time needs a real
-  query in the GE UI. It is the last unverified link in the credential chain.
-- **Private MCP servers reached by Gemini Enterprise are unproven.** `api_key`
-  and `none` servers are deployed with `run.invoker` granted to the Discovery
-  Engine service agent instead of `allUsers`. That only works if Gemini
-  Enterprise presents a Google-signed ID token audienced to the service, which
-  has never been observed — 1.0.1 asserted it does *not*, but that was an
-  inference from the design, not a measurement. If tool calls return 403, use
-  `auth_kind: "oauth_user"` or the explicit `allow_public_unauthenticated`
-  opt-in. One query in the GE UI settles it.
-- **The split between the control plane and the OAuth proxy is new in 1.0.2**
-  and has not been exercised against a live Gemini Enterprise consent flow.
-  The two services share a Firestore database; a provisioning run writes a
-  proxy client that the other service then reads. That handoff is covered by
-  tests but not yet by a real user clicking "Allow".
-- The contract knowledge base is hand-curated and does not yet update itself
-  from canary findings or agent investigations.
+  half-finished run — though such a run is resumable rather than lost.
+- The contract knowledge base is hand-curated and does not update itself from
+  canary findings or agent investigations.
+
+**Not yet exercised end to end**
+
+These paths are covered by tests and verified as far as automated checks can
+reach, but no real user has driven them in production. Expect to be the first.
+
+- **The browser consent flow through the OAuth proxy.** Everything up to the
+  upstream redirect is verified live and the token exchange has 14 hermetic
+  adversarial tests, but no human has completed a consent against a deployment.
+- **Per-user token propagation.** Whether Gemini Enterprise forwards a user's
+  token through the proxy to the MCP server at query time is the last
+  unverified link in the credential chain; one real query settles it.
+- **Private MCP servers reached by Gemini Enterprise.** `api_key` and `none`
+  servers grant `run.invoker` to the Discovery Engine service agent rather than
+  `allUsers`. That depends on Gemini Enterprise presenting a Google-signed ID
+  token audienced to the service, which has not been observed either way. If
+  tool calls return 403, switch to `auth_kind: "oauth_user"` or the explicit
+  `allow_public_unauthenticated` opt-in.
+- **Attaching to an existing Gemini Enterprise app** (the `attach` stage).
+- **The control plane / OAuth proxy split**, which is new in 1.0.2. The two
+  services share a Firestore database, and a provisioning run writes a proxy
+  client that the other service reads; that handoff has tests but no live
+  consent flow behind it.
